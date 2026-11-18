@@ -112,6 +112,33 @@ if not nuclei_iserver:
 
 nuclei_iserver = nuclei_iserver.strip()
 
+
+def nucleiScanArgs():
+    """Build validated Nuclei runtime flags for every scanning code path.
+
+    Process environment takes precedence over ~/.config/synackscan/env.
+    Values are read at invocation time so long-running bot scans can pick up
+    configuration changes from the env file between iterations.
+    """
+    settings = (
+        ("NUCLEI_CONCURRENCY", "-c", 50, 1, 1000),
+        ("NUCLEI_RATE_LIMIT", "-rl", 10, 1, 100000),
+        ("NUCLEI_BULK_SIZE", "-bs", 8, 1, 1000),
+        ("NUCLEI_TIMEOUT", "-timeout", 5, 1, 3600),
+        ("NUCLEI_RETRIES", "-retries", 0, 0, 20),
+    )
+    arguments = []
+    for key, flag, default, minimum, maximum in settings:
+        raw = loadEnvValue(key)
+        try:
+            value = default if raw is None else int(raw)
+        except ValueError as exc:
+            raise ValueError(f"Invalid {key}={raw!r}: expected an integer") from exc
+        if not minimum <= value <= maximum:
+            raise ValueError(f"Invalid {key}={value}: allowed range {minimum}..{maximum}")
+        arguments.extend((flag, str(value)))
+    return arguments
+
 # Local SQLite database. DB queries can run without Synack authentication.
 db = ReconDB(DEFAULT_DB_PATH)
 
@@ -1028,10 +1055,13 @@ def storeTechDetectionForFingerprint(codename, finding, available_tags):
     if parsed is None:
         return None
     scan_target, technology, source, detector, tags = parsed
-    db.store_technology(codename=codename, asset=scan_target,
-                        technology=technology, source=source,
-                        detector=detector, tags=tags)
-    print(f'[{codename}][tech] {technology} ({detector}) @ {scan_target}', flush=True)
+    technology_id = db.store_technology(codename=codename, asset=scan_target,
+                                        technology=technology, source=source,
+                                        detector=detector, tags=tags)
+    if technology_id is None:
+        raise RuntimeError(f'Technology persistence failed for {detector} @ {scan_target}')
+    print(f'[{codename}][tech][stored][{source}] {technology} '
+          f'({detector}) @ {scan_target}', flush=True)
     return parsed
 
 
@@ -1061,7 +1091,7 @@ def fingerprint(codename,target,path):
         pass
 
 
-def doFingerprint(context):
+def doFingerprint(context, target_filter=None, batch_size=None):
     """
     Full collection/indexing pass.
 
@@ -1082,85 +1112,99 @@ def doFingerprint(context):
         and ((target.get('category') or {}).get('name') or '').strip().lower()
         in ('host', 'web application')
         and target.get('codename')
+        and (not target_filter or str(target['codename']).casefold() == target_filter.casefold())
     ]
+    if target_filter and not selected:
+        print(f'[fingerprint] No matching eligible target: {target_filter}', flush=True)
+        return
     total = len(selected)
     print(f'[fingerprint] Processing {total} target(s)', flush=True)
 
     for position, target in enumerate(selected, start=1):
         codename = target['codename']
+        target_started_at = time.perf_counter()
+        try:
 
-        if not checkLoginStatus():
-            print("Synack authentication is no longer valid.", flush=True)
-            return
+            if not checkLoginStatus():
+                print("Synack authentication is no longer valid.", flush=True)
+                return
 
-        print(
-            f"[{position}/{total}][{codename}] Connecting to Synack target...",
-            flush=True
-        )
-
-        connect_status = connectToTarget(codename)
-
-        if connect_status < 200 or connect_status >= 300:
             print(
-                f"[{codename}] Failed to connect to target "
-                f"(HTTP {connect_status})",
+                f"[{position}/{total}][{codename}] Connecting to Synack target...",
                 flush=True
             )
-            continue
 
-        cslug = getCurrentTargetSlug()
+            connect_status = connectToTarget(codename)
 
-        if cslug == 1:
+            if connect_status < 200 or connect_status >= 300:
+                print(
+                    f"[{codename}] Failed to connect to target "
+                    f"(HTTP {connect_status})",
+                    flush=True
+                )
+                continue
+
+            cslug = getCurrentTargetSlug()
+
+            if cslug == 1:
+                print(
+                    f"[{codename}] Unable to determine current target.",
+                    flush=True
+                )
+                continue
+
+            cname = getCodenameFromSlug(context, cslug)
+
+            if cname != codename:
+                print(
+                    f"[{codename}] Target switch verification failed "
+                    f"(current target: {cname})",
+                    flush=True
+                )
+                continue
+
+            print(f"[{codename}] Connected.", flush=True)
+
+            scope = getScope(context, codename)
+
+            if not scope:
+                continue
+
+            # Preserve existing raw body/header collection.
             print(
-                f"[{codename}] Unable to determine current target.",
+                f"[{codename}][fingerprint] Saving raw content for "
+                f"{len(scope)} scoped asset(s)...",
                 flush=True
             )
-            continue
 
-        cname = getCodenameFromSlug(context, cslug)
+            for asset in scope:
+                fingerprint(codename, asset, "")
 
-        if cname != codename:
+            # Structured HTTP metadata + httpx technology fingerprints.
+            runHttpxFingerprint(codename, scope)
+
+            # All informational Nuclei technology fingerprints, no follow-on templates.
             print(
-                f"[{codename}] Target switch verification failed "
-                f"(current target: {cname})",
+                f"[{codename}][fingerprint] Running all Nuclei technology detection templates...",
                 flush=True
             )
-            continue
 
-        print(f"[{codename}] Connected.", flush=True)
+            def on_tech_finding(finding):
+                storeTechDetectionForFingerprint(
+                    codename,
+                    finding,
+                    available_tags
+                )
 
-        scope = getScope(context, codename)
-
-        if not scope:
-            continue
-
-        # Preserve existing raw body/header collection.
-        print(
-            f"[{codename}][fingerprint] Saving raw content for "
-            f"{len(scope)} scoped asset(s)...",
-            flush=True
-        )
-
-        for asset in scope:
-            fingerprint(codename, asset, "")
-
-        # Structured HTTP metadata + httpx technology fingerprints.
-        runHttpxFingerprint(codename, scope)
-
-        # All informational Nuclei technology fingerprints, no follow-on templates.
-        print(
-            f"[{codename}][fingerprint] Running all Nuclei technology detection templates...",
-            flush=True
-        )
-
-        def on_tech_finding(finding):
-            storeTechDetectionForFingerprint(
-                codename,
-                finding,
-                available_tags
-            )
-
-        runTechDetect(scope, on_finding=on_tech_finding)
+            tech_results = runTechDetect(scope, on_finding=on_tech_finding, batch_size=batch_size)
+            if tech_results is None:
+                print(f'[{codename}][fingerprint][WARNING] Nuclei tech detection '
+                      'failed for one or more assets; see diagnostics above', flush=True)
+            else:
+                print(f'[{codename}][fingerprint][summary] '
+                      f'Nuclei technology matches={len(tech_results)}', flush=True)
+        finally:
+            print(f"[{position}/{total}][{codename}] Scan elapsed: {time.perf_counter() - target_started_at:.2f} seconds", flush=True)
 
 
 def doScan(context,filter,path,matcher):
@@ -1292,101 +1336,103 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
         return
     print(f"[nuclei] {nuclei_kind}; category={category_filter}; targets={len(selected)}", flush=True)
     base_cmd = ['nuclei', nuclei_flag, template_path,
-                '-rl', '10', '-iserver', nuclei_iserver, '-silent', '-nc', '-jsonl', '-dr']
+                *nucleiScanArgs(), '-iserver', nuclei_iserver, '-silent', '-nc', '-jsonl', '-dr']
     for position, target in enumerate(selected, start=1):
         if not checkLoginStatus():
             print('Synack authentication is no longer valid.', flush=True)
             return
         codename = target['codename']
-        print(f"[{position}/{len(selected)}][{codename}] Connecting to Synack target...", flush=True)
+        target_started_at = time.perf_counter()
         try:
-            connect_status = connectToTarget(codename)
-        except requests.RequestException as exc:
-            print(f"[{codename}] Launchpoint request failed: {type(exc).__name__}: {exc}", flush=True)
-            continue
-        print(f"[{codename}] Launchpoint HTTP {connect_status}", flush=True)
-        if not 200 <= connect_status < 300:
-            print(f"[{codename}] Connection failed (HTTP {connect_status})", flush=True)
-            continue
-        try:
-            cslug = getCurrentTargetSlug()
-        except requests.RequestException as exc:
-            print(f"[{codename}] Launchpoint verification request failed: {type(exc).__name__}: {exc}", flush=True)
-            continue
-        cname = getCodenameFromSlug(context, cslug) if cslug != 1 else None
-        if cname != codename:
-            print(f"[{codename}] Target switch verification failed (expected={codename}, current={cname}, slug={cslug})", flush=True)
-            continue
-        print(f"[{codename}] Connected. Verified launchpoint: {cslug}", flush=True)
-        category = ((target.get('category') or {}).get('name') or '').strip().lower()
-        skip_discovery = (skip_existing_discovery and category == 'host'
-                          and db.has_completed_host_discovery(codename))
-        if skip_discovery:
-            print(f"[{codename}][vhost] Skipping previously completed host discovery; "
-                  "scanning original scope only.", flush=True)
-        try:
-            scope = getScope(context, codename, discover_hosts=not skip_discovery)
-        except requests.RequestException as exc:
-            print(f"[{codename}] Scope retrieval failed: {type(exc).__name__}: {exc}", flush=True)
-            continue
-        if not scope:
-            print(f"[{codename}] No active scoped assets returned; skipping Nuclei.", flush=True)
-            continue
-        # Zero vhost matches is a completed discovery too. Persist the marker.
-        if category == 'host' and not skip_discovery:
-            db.mark_host_discovery_completed(codename)
-        print(f"[{codename}] Scope loaded: {len(scope)} assets. Starting Nuclei.", flush=True)
-        stats = VHOST_DISCOVERY_STATS.get(codename)
-        if stats is not None and ((target.get('category') or {}).get('name') or '').strip().lower() == 'host':
-            print(f"[{codename}][vhost] Discovery complete: candidates_tested={stats['tested']} "
-                  f"baseline_matches={stats['baseline_matches']} different_status={stats['different_status']} "
-                  f"connection_errors={stats['connection_errors']} "
-                  f"eligible_for_nuclei={len(VHOST_CURRENT_ELIGIBLE.get(codename, set()))} "
-                  f"capped={stats['capped']}", flush=True)
-        _streamNucleiFindings(base_cmd, scope, codename)
-        category = ((target.get('category') or {}).get('name') or '').strip().lower()
-        if category != 'host' or skip_discovery:
-            continue
-        authorized_ips = set()
-        for asset in scope:
+            print(f"[{position}/{len(selected)}][{codename}] Connecting to Synack target...", flush=True)
             try:
-                authorized_ips.add(str(ipaddress.ip_address(asset)))
-            except ValueError:
+                connect_status = connectToTarget(codename)
+            except requests.RequestException as exc:
+                print(f"[{codename}] Launchpoint request failed: {type(exc).__name__}: {exc}", flush=True)
                 continue
-        # Never substitute discovered hostnames as standalone targets.
-        # Only scan successful pinned-IP HTTPS vhosts discovered under this target.
-        rows = db.get_vhosts_for_nuclei(codename)
-        seen = set()
-        approved = VHOST_CURRENT_ELIGIBLE.get(codename, set())
-        accepted_pairs = []
-        for row in rows:
-            ip = row['ip']
-            hostname = row['hostname']
-            # Never Nuclei-scan stale database entries from IPs whose current
-            # HTTPS precheck failed (even when an old row is marked distinct).
-            if (ip not in authorized_ips or
-                    ip not in VHOST_LIVE_HTTPS_IPS.get(codename, set()) or
-                    (ip, hostname) not in approved or
-                    (ip, hostname) in seen):
+            print(f"[{codename}] Launchpoint HTTP {connect_status}", flush=True)
+            if not 200 <= connect_status < 300:
+                print(f"[{codename}] Connection failed (HTTP {connect_status})", flush=True)
                 continue
-            if not validDnsName(hostname) or hostname.startswith('*.'):
+            try:
+                cslug = getCurrentTargetSlug()
+            except requests.RequestException as exc:
+                print(f"[{codename}] Launchpoint verification request failed: {type(exc).__name__}: {exc}", flush=True)
                 continue
-            seen.add((ip, hostname))
-            accepted_pairs.append((ip, hostname))
-        print(f"[{codename}][nuclei][vhost] Accepted pairs for this run: {len(accepted_pairs)}", flush=True)
-        for ip, hostname in sorted(accepted_pairs):
-            print(f"[{codename}][nuclei][vhost][accepted] {ip}:443 SNI/Host={hostname}", flush=True)
-        for ip, hostname in sorted(accepted_pairs):
-            print(f"[{codename}][nuclei][vhost] scanning {hostname} @ {ip}:443", flush=True)
-            vhost_cmd = base_cmd + [
-                '-u', f'https://{ip}', '-sni', hostname, '-H', f'Host: {hostname}', '-nh'
-            ]
-            _streamNucleiFindings(vhost_cmd, None, codename, vhost=(ip, hostname))
+            cname = getCodenameFromSlug(context, cslug) if cslug != 1 else None
+            if cname != codename:
+                print(f"[{codename}] Target switch verification failed (expected={codename}, current={cname}, slug={cslug})", flush=True)
+                continue
+            print(f"[{codename}] Connected. Verified launchpoint: {cslug}", flush=True)
+            category = ((target.get('category') or {}).get('name') or '').strip().lower()
+            skip_discovery = (skip_existing_discovery and category == 'host'
+                              and db.has_completed_host_discovery(codename))
+            if skip_discovery:
+                print(f"[{codename}][vhost] Skipping previously completed host discovery; "
+                      "scanning original scope only.", flush=True)
+            try:
+                scope = getScope(context, codename, discover_hosts=not skip_discovery)
+            except requests.RequestException as exc:
+                print(f"[{codename}] Scope retrieval failed: {type(exc).__name__}: {exc}", flush=True)
+                continue
+            if not scope:
+                print(f"[{codename}] No active scoped assets returned; skipping Nuclei.", flush=True)
+                continue
+            # Zero vhost matches is a completed discovery too. Persist the marker.
+            if category == 'host' and not skip_discovery:
+                db.mark_host_discovery_completed(codename)
+            print(f"[{codename}] Scope loaded: {len(scope)} assets. Starting Nuclei.", flush=True)
+            stats = VHOST_DISCOVERY_STATS.get(codename)
+            if stats is not None and ((target.get('category') or {}).get('name') or '').strip().lower() == 'host':
+                print(f"[{codename}][vhost] Discovery complete: candidates_tested={stats['tested']} "
+                      f"baseline_matches={stats['baseline_matches']} different_status={stats['different_status']} "
+                      f"connection_errors={stats['connection_errors']} "
+                      f"eligible_for_nuclei={len(VHOST_CURRENT_ELIGIBLE.get(codename, set()))} "
+                      f"capped={stats['capped']}", flush=True)
+            _streamNucleiFindings(base_cmd, scope, codename)
+            category = ((target.get('category') or {}).get('name') or '').strip().lower()
+            if category != 'host' or skip_discovery:
+                continue
+            authorized_ips = set()
+            for asset in scope:
+                try:
+                    authorized_ips.add(str(ipaddress.ip_address(asset)))
+                except ValueError:
+                    continue
+            # Never substitute discovered hostnames as standalone targets.
+            # Only scan successful pinned-IP HTTPS vhosts discovered under this target.
+            rows = db.get_vhosts_for_nuclei(codename)
+            seen = set()
+            approved = VHOST_CURRENT_ELIGIBLE.get(codename, set())
+            accepted_pairs = []
+            for row in rows:
+                ip = row['ip']
+                hostname = row['hostname']
+                # Never Nuclei-scan stale database entries from IPs whose current
+                # HTTPS precheck failed (even when an old row is marked distinct).
+                if (ip not in authorized_ips or
+                        ip not in VHOST_LIVE_HTTPS_IPS.get(codename, set()) or
+                        (ip, hostname) not in approved or
+                        (ip, hostname) in seen):
+                    continue
+                if not validDnsName(hostname) or hostname.startswith('*.'):
+                    continue
+                seen.add((ip, hostname))
+                accepted_pairs.append((ip, hostname))
+            print(f"[{codename}][nuclei][vhost] Accepted pairs for this run: {len(accepted_pairs)}", flush=True)
+            for ip, hostname in sorted(accepted_pairs):
+                print(f"[{codename}][nuclei][vhost][accepted] {ip}:443 SNI/Host={hostname}", flush=True)
+            for ip, hostname in sorted(accepted_pairs):
+                print(f"[{codename}][nuclei][vhost] scanning {hostname} @ {ip}:443", flush=True)
+                vhost_cmd = base_cmd + [
+                    '-u', f'https://{ip}', '-sni', hostname, '-H', f'Host: {hostname}', '-nh'
+                ]
+                _streamNucleiFindings(vhost_cmd, None, codename, vhost=(ip, hostname))
 
+        finally:
+            print(f"[{position}/{len(selected)}][{codename}] Scan elapsed: {time.perf_counter() - target_started_at:.2f} seconds", flush=True)
 
-# Run EVERY installed informational technology template, including the generic
-# tech-detect.yaml and standalone per-product detectors (e.g. Tableau Server).
-# Keep this directory-only scope: do NOT scan generic vulnerability templates.
+# Run every informational technology template under this directory.
 TECH_DETECT_DIRECTORY = os.path.expanduser('~/nuclei-templates/http/technologies')
 
 
@@ -1648,60 +1694,135 @@ def normalizeDetectedTarget(finding):
     return "https://" + matched
 
 
-def runTechDetect(scope, on_finding=None):
-    """Run all informational HTTP technology templates over the current scope.
+def runTechDetect(scope, on_finding=None, batch_size=None):
+    """Run all informational technology templates against the full scope by default.
 
-    The entire technologies directory is selected, not only `tech-detect.yaml`
-    or templates carrying a particular tag. Restrict to severity info so this
-    fingerprint phase does not run vulnerability-checking severity templates.
-    Findings are streamed as JSONL for incremental database storage.
+    Optionally split into batches with fingerprint --batch-size N. Every JSONL
+    match is logged and passed to the persistence callback. A failed batch is
+    retried asset-by-asset for diagnostic visibility.
     """
     if not scope:
         return []
     if not os.path.isdir(TECH_DETECT_DIRECTORY):
-        print(f'Technology template directory missing: {TECH_DETECT_DIRECTORY}', flush=True)
+        print(f'[tech-detect][error] Missing directory: {TECH_DETECT_DIRECTORY}', flush=True)
         return None
 
-    cmd = [
-        'nuclei', '-t', TECH_DETECT_DIRECTORY,
-        '-severity', 'info',
-        '-rl', '10', '-iserver', nuclei_iserver,
-        '-silent', '-jsonl', '-nc', '-dr'
-    ]
-    print(f'[tech-detect] Running ALL informational templates from '
-          f'{TECH_DETECT_DIRECTORY} on {len(scope)} asset(s)', flush=True)
+    import tempfile
+
+    assets = list(dict.fromkeys(str(v).strip() for v in scope if str(v).strip()))
+    if not assets:
+        return []
+    if batch_size is None:
+        batch_size = len(assets)  # Default: one Nuclei process for the entire scope.
+    if not isinstance(batch_size, int) or batch_size < 1:
+        print(f'[tech-detect][error] Invalid batch size: {batch_size!r}', flush=True)
+        return None
+
+    batches = [assets[i:i + batch_size] for i in range(0, len(assets), batch_size)]
     findings = []
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, bufsize=1)
-        if proc.stdin:
-            proc.stdin.write('\n'.join(scope) + '\n')
-            proc.stdin.close()
-        if proc.stdout:
-            for line in proc.stdout:
+    completed = 0
+    failed = 0
+    total = len(assets)
+    print(f'[tech-detect] Running informational technology templates: '
+          f'assets={total}, batch_size={batch_size}, batches={len(batches)}', flush=True)
+
+    def run_batch(batch, label):
+        """Return True only when subprocess, parsing and persistence succeed."""
+        nonlocal completed
+        cmd = ['nuclei', '-t', TECH_DETECT_DIRECTORY, '-severity', 'info',
+               *nucleiScanArgs(), '-iserver', nuclei_iserver, '-silent', '-jsonl', '-nc', '-dr']
+        input_file_path = None
+        matches = 0
+        parse_errors = 0
+        storage_errors = 0
+        process = None
+        try:
+            # A real -l file avoids ambiguity around stdin/target parsing.
+            # Use -u when only one asset is present, matching the known-good test.
+            if len(batch) == 1:
+                cmd += ['-u', batch[0]]
+            else:
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                                 prefix='synackscan-nuclei-',
+                                                 suffix='.txt', delete=False) as handle:
+                    handle.write('\n'.join(batch) + '\n')
+                    input_file_path = handle.name
+                cmd += ['-l', input_file_path]
+
+            print(f'[tech-detect][{label}] START assets={len(batch)} '
+                  f'first={batch[0]}', flush=True)
+            with tempfile.TemporaryFile(mode='w+t', encoding='utf-8') as errors:
+                process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=errors,
+                                           text=True, bufsize=1)
+                for raw in process.stdout:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        finding = json.loads(line)
+                        if not isinstance(finding, dict):
+                            raise ValueError('not a JSON object')
+                    except (ValueError, TypeError) as exc:
+                        parse_errors += 1
+                        print(f'[tech-detect][{label}][parse-error] '
+                              f'{type(exc).__name__}: {line[:160]}', flush=True)
+                        continue
+                    matches += 1
+                    detector = finding.get('template-id') or finding.get('templateID') or '?'
+                    matched = (finding.get('matched-at') or finding.get('matched_at')
+                               or finding.get('host') or '?')
+                    print(f'[tech-detect][{label}][MATCH] {detector} @ {matched}', flush=True)
+                    try:
+                        if on_finding is not None:
+                            on_finding(finding)
+                        findings.append(finding)
+                    except Exception as exc:
+                        storage_errors += 1
+                        print(f'[tech-detect][{label}][storage-error] {detector}: '
+                              f'{type(exc).__name__}: {exc}', flush=True)
+                code = process.wait()
+                errors.seek(0)
+                stderr = errors.read().strip()
+            ok = code == 0 and not parse_errors and not storage_errors
+            if ok:
+                completed += len(batch)
+            print(f'[tech-detect][{label}][{"done" if ok else "FAILED"}] '
+                  f'assets={len(batch)} matches={matches} exit={code} '
+                  f'parse_errors={parse_errors} storage_errors={storage_errors}', flush=True)
+            if not ok and stderr:
+                print(f'[tech-detect][{label}][stderr] '
+                      + ' | '.join(stderr.splitlines()[-8:])[-1600:], flush=True)
+            return ok
+        except (OSError, ValueError) as exc:
+            print(f'[tech-detect][{label}][FAILED] '
+                  f'{type(exc).__name__}: {exc}', flush=True)
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            return False
+        finally:
+            if input_file_path is not None:
                 try:
-                    finding = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(finding, dict):
-                    continue
-                findings.append(finding)
-                if on_finding:
-                    on_finding(finding)
-        stderr = proc.stderr.read().strip() if proc.stderr else ''
-        code = proc.wait()
-        if code != 0:
-            print(f'[tech-detect] Nuclei exited with status {code}: '
-                  f'{stderr[-800:]}', flush=True)
-            return None
-    except FileNotFoundError:
-        print('[tech-detect] Nuclei executable missing from PATH', flush=True)
-        return None
-    except (OSError, ValueError) as exc:
-        print(f'[tech-detect] {type(exc).__name__}: {exc}', flush=True)
-        return None
-    return findings
+                    os.unlink(input_file_path)
+                except OSError:
+                    pass
+
+    for index, batch in enumerate(batches, 1):
+        label = f'{index}/{len(batches)}'
+        if run_batch(batch, label):
+            continue
+        if len(batch) == 1:
+            failed += 1
+            continue
+        print(f'[tech-detect][{label}] Retrying failed batch per asset...', flush=True)
+        for offset, asset in enumerate(batch, 1):
+            if not run_batch([asset], f'{label}:retry-{offset}/{len(batch)}'):
+                failed += 1
+
+    print(f'[tech-detect][summary] assets={total} completed={completed} '
+          f'failed={failed} findings={len(findings)}', flush=True)
+    return None if failed else findings
 
 
 def getTemplatesForTag(tag):
@@ -1782,7 +1903,7 @@ def runTaggedNuclei(codename, tag, hosts):
     cmd = [
         "nuclei",
         "-tags", tag,
-        "-rl", "10",
+        *nucleiScanArgs(),
         "-iserver", nuclei_iserver,
         "-silent",
         "-nc"
@@ -1893,92 +2014,96 @@ def runSmartScan(context, target_filter=None, new_only=False):
     print(f'[smartscan] Processing {total} target(s)', flush=True)
     for position, target in enumerate(selected, start=1):
         codename = target['codename']
-
-        if not checkLoginStatus():
-            print("Synack authentication is no longer valid.", flush=True)
-            return
-
-        print(f"[{position}/{total}][{codename}] Connecting to Synack target...", flush=True)
-
-        connect_status = connectToTarget(codename)
-
-        if connect_status < 200 or connect_status >= 300:
-            print(
-                f"[{codename}] Failed to connect to target "
-                f"(HTTP {connect_status})",
-                flush=True
-            )
-            continue
-
-        cslug = getCurrentTargetSlug()
-
-        if cslug == 1:
-            print(f"[{codename}] Unable to determine current target.", flush=True)
-            continue
-
-        cname = getCodenameFromSlug(context, cslug)
-
-        if cname != codename:
-            print(
-                f"[{codename}] Target switch verification failed "
-                f"(current target: {cname})",
-                flush=True
-            )
-            continue
-
-        print(f"[{codename}] Connected.", flush=True)
-
-        scope = getScope(context, codename)
-
-        if not scope:
-            continue
-
-        print(
-            f"[{codename}] Running tech detection against "
-            f"{len(scope)} scoped asset(s)...",
-            flush=True
-        )
-
-        scan_run_id = db.start_smartscan(codename)
-        scan_success = True
-        scan_error = None
-
-        hosts_by_tag = defaultdict(set)
-
-        def handleTechFinding(finding):
-            parsed = storeTechDetectionForFingerprint(codename, finding, available_tags)
-            if parsed is None:
-                return
-            scan_target, technology, _source, _detector, tags = parsed
-            for tag in tags:
-                hosts_by_tag[tag].add(scan_target)
-                print(f'[{codename}][tech] {technology} -> {tag} @ {scan_target}', flush=True)
-
+        target_started_at = time.perf_counter()
         try:
-            tech_results = runTechDetect(scope, on_finding=handleTechFinding)
-            if tech_results is None:
+
+            if not checkLoginStatus():
+                print("Synack authentication is no longer valid.", flush=True)
+                return
+
+            print(f"[{position}/{total}][{codename}] Connecting to Synack target...", flush=True)
+
+            connect_status = connectToTarget(codename)
+
+            if connect_status < 200 or connect_status >= 300:
+                print(
+                    f"[{codename}] Failed to connect to target "
+                    f"(HTTP {connect_status})",
+                    flush=True
+                )
+                continue
+
+            cslug = getCurrentTargetSlug()
+
+            if cslug == 1:
+                print(f"[{codename}] Unable to determine current target.", flush=True)
+                continue
+
+            cname = getCodenameFromSlug(context, cslug)
+
+            if cname != codename:
+                print(
+                    f"[{codename}] Target switch verification failed "
+                    f"(current target: {cname})",
+                    flush=True
+                )
+                continue
+
+            print(f"[{codename}] Connected.", flush=True)
+
+            scope = getScope(context, codename)
+
+            if not scope:
+                continue
+
+            print(
+                f"[{codename}] Running tech detection against "
+                f"{len(scope)} scoped asset(s)...",
+                flush=True
+            )
+
+            scan_run_id = db.start_smartscan(codename)
+            scan_success = True
+            scan_error = None
+
+            hosts_by_tag = defaultdict(set)
+
+            def handleTechFinding(finding):
+                parsed = storeTechDetectionForFingerprint(codename, finding, available_tags)
+                if parsed is None:
+                    return
+                scan_target, technology, _source, _detector, tags = parsed
+                for tag in tags:
+                    hosts_by_tag[tag].add(scan_target)
+                    print(f'[{codename}][tech] {technology} -> {tag} @ {scan_target}', flush=True)
+
+            try:
+                tech_results = runTechDetect(scope, on_finding=handleTechFinding)
+                if tech_results is None:
+                    scan_success = False
+                    scan_error = "tech-detect failed"
+
+                if scan_success:
+                    for tag in sorted(hosts_by_tag):
+                        host_count = len(hosts_by_tag[tag])
+                        print(
+                            f"[{codename}][smartscan] running tag "
+                            f"{tag} against {host_count} host(s)",
+                            flush=True
+                        )
+                        if not runTaggedNuclei(codename, tag, hosts_by_tag[tag]):
+                            scan_success = False
+                            scan_error = f"tag scan failed: {tag}"
+
+            except Exception as exc:
                 scan_success = False
-                scan_error = "tech-detect failed"
-
-            if scan_success:
-                for tag in sorted(hosts_by_tag):
-                    host_count = len(hosts_by_tag[tag])
-                    print(
-                        f"[{codename}][smartscan] running tag "
-                        f"{tag} against {host_count} host(s)",
-                        flush=True
-                    )
-                    if not runTaggedNuclei(codename, tag, hosts_by_tag[tag]):
-                        scan_success = False
-                        scan_error = f"tag scan failed: {tag}"
-
-        except Exception as exc:
-            scan_success = False
-            scan_error = str(exc)
-            print(f"[{codename}][smartscan] error: {exc}", flush=True)
+                scan_error = str(exc)
+                print(f"[{codename}][smartscan] error: {exc}", flush=True)
+            finally:
+                db.finish_smartscan(scan_run_id, scan_success, scan_error)
+                print(f"[{codename}][smartscan] {'completed' if scan_success else 'failed'}", flush=True)
         finally:
-            db.finish_smartscan(scan_run_id, scan_success, scan_error)
-            print(f"[{codename}][smartscan] {'completed' if scan_success else 'failed'}", flush=True)
+            print(f"[{position}/{total}][{codename}] Scan elapsed: {time.perf_counter() - target_started_at:.2f} seconds", flush=True)
 
 
     if target_filter and not matched_target:
@@ -1990,7 +2115,7 @@ def runBotNuclei(codename, scope):
     severities = botSeverities()
     cmd = [
         'nuclei', '-severity', ','.join(severities),
-        '-rl', '10', '-iserver', nuclei_iserver, '-jsonl', '-silent', '-nc',
+        *nucleiScanArgs(), '-iserver', nuclei_iserver, '-jsonl', '-silent', '-nc',
     ]
     print(f'[{codename}][bot] Nuclei severities: {",".join(severities)}; assets={len(scope)}', flush=True)
     try:
@@ -2177,28 +2302,33 @@ def runBot(context, interval=600, once=False):
                     total_pending = len(pending_targets)
                     for position, target in enumerate(pending_targets, start=1):
                         codename = target["codename"]
-                        print(f'[{position}/{total_pending}][{codename}][bot] Processing target', flush=True)
-                        synack_id = str(target["id"])
-                        if db.has_completed_smartscan(codename):
-                            print(f"[{codename}][bot] Previously scanned; skipping", flush=True)
-                            db.bot_set_status(synack_id, "completed")
-                            continue
-                        scan_id = db.start_smartscan(codename)
-                        db.bot_set_status(synack_id, "scanning")
+                        target_started_at = time.perf_counter()
                         try:
-                            runBotTarget(context, codename)
-                        except KeyboardInterrupt:
-                            db.finish_smartscan(scan_id, False, "Interrupted")
-                            db.bot_set_status(synack_id, "failed")
-                            raise
-                        except Exception as exc:
-                            db.finish_smartscan(scan_id, False, str(exc))
-                            db.bot_set_status(synack_id, "failed")
-                            print(f"[{codename}][bot] Failed: {exc}", flush=True)
-                        else:
-                            db.finish_smartscan(scan_id, True)
-                            db.bot_set_status(synack_id, "completed")
-                            print(f"[{codename}][bot] Completed", flush=True)
+                            print(f'[{position}/{total_pending}][{codename}][bot] Processing target', flush=True)
+                            synack_id = str(target["id"])
+                            if db.has_completed_smartscan(codename):
+                                print(f"[{codename}][bot] Previously scanned; skipping", flush=True)
+                                db.bot_set_status(synack_id, "completed")
+                                continue
+                            scan_id = db.start_smartscan(codename)
+                            db.bot_set_status(synack_id, "scanning")
+                            try:
+                                runBotTarget(context, codename)
+                            except KeyboardInterrupt:
+                                db.finish_smartscan(scan_id, False, "Interrupted")
+                                db.bot_set_status(synack_id, "failed")
+                                raise
+                            except Exception as exc:
+                                db.finish_smartscan(scan_id, False, str(exc))
+                                db.bot_set_status(synack_id, "failed")
+                                print(f"[{codename}][bot] Failed: {exc}", flush=True)
+                            else:
+                                db.finish_smartscan(scan_id, True)
+                                db.bot_set_status(synack_id, "completed")
+                                print(f"[{codename}][bot] Completed", flush=True)
+                        finally:
+                            print(f"[{position}/{total_pending}][{codename}] Scan elapsed: {time.perf_counter() - target_started_at:.2f} seconds", flush=True)
+
         except KeyboardInterrupt:
             print("\n[bot] Stopped", flush=True)
             return 0
@@ -2249,7 +2379,17 @@ elif module == "checkin":
     registerAllTargets()
 
 elif module == "fingerprint":
-    doFingerprint(context)
+    import argparse
+    parser = argparse.ArgumentParser(prog=f"{sys.argv[0]} fingerprint")
+    parser.add_argument("--target", "-t", metavar="CODENAME",
+                        help="Fingerprint only the specified Synack target")
+    parser.add_argument("--batch-size", type=int, metavar="N",
+                        help="Optional number of assets per Nuclei process (default: all assets together)")
+    parser.add_argument("--bearer", help="Synack bearer token (existing option)")
+    args = parser.parse_args(sys.argv[2:])
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be a positive integer")
+    doFingerprint(context, target_filter=args.target, batch_size=args.batch_size)
 
 elif module == "exec":
     if len(sys.argv) < 4:
