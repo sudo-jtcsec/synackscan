@@ -38,6 +38,12 @@ class ReconDB:
                 last_seen TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS host_discovery_completed (
+                target_id INTEGER PRIMARY KEY,
+                completed_at TEXT NOT NULL,
+                FOREIGN KEY(target_id) REFERENCES targets(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS bot_seen_targets (
                 synack_id TEXT PRIMARY KEY,
                 codename TEXT NOT NULL,
@@ -202,7 +208,34 @@ class ReconDB:
                 ON http_observations(ip);
             """
         )
+        # Legacy databases may already have discovered host assets or vhosts.
+        # Backfill once, before new targets are synced into this database.
+        self.conn.execute("""
+            INSERT OR IGNORE INTO host_discovery_completed (target_id, completed_at)
+            SELECT t.id, ? FROM targets t
+            WHERE lower(COALESCE(t.category, '')) = 'host'
+              AND (
+                  EXISTS (SELECT 1 FROM assets a WHERE a.target_id=t.id
+                          AND a.asset_type IN ('host-ip', 'host-rdns'))
+                  OR EXISTS (SELECT 1 FROM vhost_observations v WHERE v.target_id=t.id)
+              )
+        """, (utcnow(),))
         self.conn.commit()
+
+    def has_completed_host_discovery(self, codename):
+        return self.conn.execute("""
+            SELECT 1 FROM host_discovery_completed d
+            JOIN targets t ON t.id = d.target_id
+            WHERE lower(t.codename) = lower(?) LIMIT 1
+        """, (codename,)).fetchone() is not None
+
+    def mark_host_discovery_completed(self, codename):
+        target_id = self.ensure_target(codename)
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO host_discovery_completed(target_id, completed_at)
+                VALUES (?, ?)
+            """, (target_id, utcnow()))
 
     def store_bot_finding(self, codename, finding):
         """Persist full finding locally; never forward finding contents to Slack.

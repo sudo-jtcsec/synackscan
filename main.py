@@ -21,6 +21,7 @@ ROOT_URL_ENV_NAME = "SYNACK_ROOT_URL"
 NUCLEI_ISERVER_ENV_NAME = "NUCLEI_ISERVER"
 SLACK_WEBHOOK_ENV_NAME = "SLACK_WEBHOOK_URL"
 BOT_SEVERITIES_ENV_NAME = "BOT_SEVERITIES"
+EXCLUDED_TARGETS_ENV_NAME = "EXCLUDED_TARGETS"
 
 DEFAULT_ROOT_URL = "https://platform.synack.us"
 DEFAULT_NUCLEI_ISERVER = "w4.to"
@@ -77,6 +78,22 @@ def loadEnvValue(key):
         return value
 
     return None
+
+
+def excludedTargetCodenames():
+    """Read a comma-separated, case-insensitive skip list from the env file.
+
+    Re-read for each target refresh so bot runs can pick up changes without restart.
+    """
+    raw = loadEnvFile().get(EXCLUDED_TARGETS_ENV_NAME, '')
+    # Explicit process environment overrides the persisted configuration.
+    if EXCLUDED_TARGETS_ENV_NAME in os.environ:
+        raw = os.environ[EXCLUDED_TARGETS_ENV_NAME]
+    return {name.strip().casefold() for name in raw.split(',') if name.strip()}
+
+
+def isExcludedTarget(codename):
+    return str(codename or '').strip().casefold() in excludedTargetCodenames()
 
 
 platform_url = loadEnvValue(ROOT_URL_ENV_NAME)
@@ -268,7 +285,17 @@ def getAllTargets(context):
     if status:
         resp = requests.get(platform_url+"/api/targets/registered_summary",headers=headers,verify=False)
         if resp.status_code == 200:
-            context['targetlist'] = resp.json()
+            targets = resp.json()
+            if not isinstance(targets, list):
+                print('[targets] Unexpected registered target response; refusing to scan.', flush=True)
+                return False
+            excluded = excludedTargetCodenames()
+            skipped = [target for target in targets if isinstance(target, dict)
+                       and str(target.get('codename') or '').strip().casefold() in excluded]
+            context['targetlist'] = [target for target in targets if isinstance(target, dict)
+                                     and str(target.get('codename') or '').strip().casefold() not in excluded]
+            for target in skipped:
+                print(f"[targets][excluded] Skipping {target.get('codename')}", flush=True)
             db.sync_targets(context['targetlist'])
             return True
     return False
@@ -322,6 +349,11 @@ def registerAllTargets():
 
             if len(jsonResponse) != 0:
                 for item in jsonResponse:
+                    if not isinstance(item, dict) or not item.get('slug'):
+                        continue
+                    if isExcludedTarget(item.get('codename')):
+                        print(f"[register][excluded] Skipping {item.get('codename')}", flush=True)
+                        continue
                     unregistered_slugs.append(str(item["slug"]))
                 pageNum += 1
             else:
@@ -376,6 +408,8 @@ def registerAllTargets():
 
 
 def connectToTarget(codename):
+    if isExcludedTarget(codename):
+        raise ValueError(f"Target {codename} is excluded by {EXCLUDED_TARGETS_ENV_NAME}")
     slug = getTargetID(context,codename)
     url_launchpoint = "/api/launchpoint"
     data = {"listing_id":slug}
@@ -688,7 +722,7 @@ def discoverScopedIPVhosts(codename, ip_address):
           flush=True)
 
 
-def getScope(context, codename):
+def getScope(context, codename, discover_hosts=True):
     target = getTargetInfo(context, codename)
 
     if target is None:
@@ -790,7 +824,7 @@ def getScope(context, codename):
 
                 add_scope_value(ip_address, "host-ip")
 
-                if category_name == "host":
+                if category_name == "host" and discover_hosts:
                     resolved_hostname = reverseResolveIP(ip_address)
 
                     if resolved_hostname:
@@ -819,7 +853,7 @@ def getScope(context, codename):
             if url:
                 add_scope_value(url, "webapp")
 
-    if category_name == 'host' and host_ip_candidates:
+    if category_name == 'host' and discover_hosts and host_ip_candidates:
         responsive = findHttps443IPs(codename, host_ip_candidates)
         VHOST_LIVE_HTTPS_IPS[codename] = responsive
         for scoped_ip in sorted(responsive):
@@ -866,6 +900,7 @@ def runHttpxFingerprint(codename, scope):
         "httpx",
         "-json",
         "-silent",
+        "-td",  # Populate JSON `tech` with Wappalyzer fingerprints.
         "-rl", "10"
     ]
 
@@ -956,39 +991,48 @@ def runHttpxFingerprint(codename, scope):
         )
 
 
-def storeTechDetectionForFingerprint(codename, finding, available_tags):
-    """
-    Persist a Nuclei tech-detect finding without launching any follow-on
-    templates.
-    """
-    matcher = (
-        finding.get("matcher-name")
-        or finding.get("matcher_name")
-        or ""
-    )
+def parseNucleiTechnologyFinding(finding, available_tags):
+    """Recognize both generic named matchers and standalone technology templates.
 
+    Generic tech-detect findings identify the product through matcher-name;
+    standalone *-detect templates usually have no named matcher, so use their
+    human-readable info.name and keep the template ID as detector provenance.
+    """
+    if not isinstance(finding, dict):
+        return None
     scan_target = normalizeDetectedTarget(finding)
+    if not scan_target:
+        return None
+    matcher = str(finding.get('matcher-name') or finding.get('matcher_name') or '').strip()
+    template_id = str(finding.get('template-id') or finding.get('templateID') or '').strip()
+    info = finding.get('info') if isinstance(finding.get('info'), dict) else {}
+    if matcher:
+        technology = matcher
+        source = 'nuclei-tech-detect'
+        detector = matcher
+    elif template_id:
+        technology = str(info.get('name') or template_id).strip()
+        # Display product names without the generic " - Detect" suffix.
+        technology = re.sub(r'\s*[-–:]\s*Detect(?:ion)?\s*$', '', technology, flags=re.I).strip()
+        source = 'nuclei-technology-template'
+        detector = template_id
+    else:
+        return None
+    tags = resolveTechTags(matcher or template_id, available_tags)
+    return scan_target, technology, source, detector, tags
 
-    if not matcher or not scan_target:
-        return
 
-    tags = resolveTechTags(matcher, available_tags)
-
-    db.store_technology(
-        codename=codename,
-        asset=scan_target,
-        technology=matcher,
-        source="nuclei-tech-detect",
-        detector=matcher,
-        tags=tags,
-    )
-
-    tag_text = ",".join(tags) if tags else "-"
-    print(
-        f"[{codename}][tech] {matcher} "
-        f"tags={tag_text} @ {scan_target}",
-        flush=True
-    )
+def storeTechDetectionForFingerprint(codename, finding, available_tags):
+    """Store all matched Nuclei technology detections, including no-matcher templates."""
+    parsed = parseNucleiTechnologyFinding(finding, available_tags)
+    if parsed is None:
+        return None
+    scan_target, technology, source, detector, tags = parsed
+    db.store_technology(codename=codename, asset=scan_target,
+                        technology=technology, source=source,
+                        detector=detector, tags=tags)
+    print(f'[{codename}][tech] {technology} ({detector}) @ {scan_target}', flush=True)
+    return parsed
 
 
 def fingerprint(codename,target,path):
@@ -1032,15 +1076,17 @@ def doFingerprint(context):
     """
     available_tags = getAvailableNucleiTags()
 
-    for target in context['targetlist']:
-        try:
-            category_name = target['category']['name'].lower()
-        except (KeyError, TypeError, AttributeError):
-            continue
+    selected = [
+        target for target in context.get('targetlist', [])
+        if isinstance(target, dict)
+        and ((target.get('category') or {}).get('name') or '').strip().lower()
+        in ('host', 'web application')
+        and target.get('codename')
+    ]
+    total = len(selected)
+    print(f'[fingerprint] Processing {total} target(s)', flush=True)
 
-        if category_name not in ("host", "web application"):
-            continue
-
+    for position, target in enumerate(selected, start=1):
         codename = target['codename']
 
         if not checkLoginStatus():
@@ -1048,7 +1094,7 @@ def doFingerprint(context):
             return
 
         print(
-            f"[{codename}] Connecting to Synack target...",
+            f"[{position}/{total}][{codename}] Connecting to Synack target...",
             flush=True
         )
 
@@ -1101,9 +1147,9 @@ def doFingerprint(context):
         # Structured HTTP metadata + httpx technology fingerprints.
         runHttpxFingerprint(codename, scope)
 
-        # Structured Nuclei tech-detect fingerprints, no follow-on templates.
+        # All informational Nuclei technology fingerprints, no follow-on templates.
         print(
-            f"[{codename}][fingerprint] Running Nuclei tech-detect...",
+            f"[{codename}][fingerprint] Running all Nuclei technology detection templates...",
             flush=True
         )
 
@@ -1208,12 +1254,12 @@ def _streamNucleiFindings(cmd, scope, codename, vhost=None):
         return False
 
 
-def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind="auto", target_filter=None):
-    """Scan original scoped assets, then TLS SAN/CN/Chaos vhosts pinned to each scoped IP.
+def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind="auto", target_filter=None, skip_existing_discovery=False):
+    """Scan scoped assets; optionally skip discovery on previously seen Host targets.
 
-    The vhost scan uses -u https://IP -sni hostname -H Host:hostname.
-    This does not DNS-resolve the candidate hostname or follow redirects.
-    Findings for vhosts are stored separately to retain the original IP binding.
+    Skipping discovery still fetches current scope, but avoids PTR, TLS/HTTPS,
+    Chaos, and vhost probes. Previously observed vhosts are not reused without
+    fresh eligibility checks; original scoped assets still run Nuclei.
     """
     template_path = os.path.expanduser(template_path)
     if nuclei_kind not in {"auto", "template", "workflow"}:
@@ -1247,12 +1293,12 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
     print(f"[nuclei] {nuclei_kind}; category={category_filter}; targets={len(selected)}", flush=True)
     base_cmd = ['nuclei', nuclei_flag, template_path,
                 '-rl', '10', '-iserver', nuclei_iserver, '-silent', '-nc', '-jsonl', '-dr']
-    for target in selected:
+    for position, target in enumerate(selected, start=1):
         if not checkLoginStatus():
             print('Synack authentication is no longer valid.', flush=True)
             return
         codename = target['codename']
-        print(f"[{codename}] Connecting to Synack target...", flush=True)
+        print(f"[{position}/{len(selected)}][{codename}] Connecting to Synack target...", flush=True)
         try:
             connect_status = connectToTarget(codename)
         except requests.RequestException as exc:
@@ -1272,14 +1318,23 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
             print(f"[{codename}] Target switch verification failed (expected={codename}, current={cname}, slug={cslug})", flush=True)
             continue
         print(f"[{codename}] Connected. Verified launchpoint: {cslug}", flush=True)
+        category = ((target.get('category') or {}).get('name') or '').strip().lower()
+        skip_discovery = (skip_existing_discovery and category == 'host'
+                          and db.has_completed_host_discovery(codename))
+        if skip_discovery:
+            print(f"[{codename}][vhost] Skipping previously completed host discovery; "
+                  "scanning original scope only.", flush=True)
         try:
-            scope = getScope(context, codename)  # discovers and persists certificate vhosts
+            scope = getScope(context, codename, discover_hosts=not skip_discovery)
         except requests.RequestException as exc:
             print(f"[{codename}] Scope retrieval failed: {type(exc).__name__}: {exc}", flush=True)
             continue
         if not scope:
             print(f"[{codename}] No active scoped assets returned; skipping Nuclei.", flush=True)
             continue
+        # Zero vhost matches is a completed discovery too. Persist the marker.
+        if category == 'host' and not skip_discovery:
+            db.mark_host_discovery_completed(codename)
         print(f"[{codename}] Scope loaded: {len(scope)} assets. Starting Nuclei.", flush=True)
         stats = VHOST_DISCOVERY_STATS.get(codename)
         if stats is not None and ((target.get('category') or {}).get('name') or '').strip().lower() == 'host':
@@ -1290,7 +1345,7 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
                   f"capped={stats['capped']}", flush=True)
         _streamNucleiFindings(base_cmd, scope, codename)
         category = ((target.get('category') or {}).get('name') or '').strip().lower()
-        if category != 'host':
+        if category != 'host' or skip_discovery:
             continue
         authorized_ips = set()
         for asset in scope:
@@ -1329,9 +1384,11 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
             _streamNucleiFindings(vhost_cmd, None, codename, vhost=(ip, hostname))
 
 
-TECH_DETECT_TEMPLATE = os.path.expanduser(
-    "~/nuclei-templates/http/technologies/tech-detect.yaml"
-)
+# Run EVERY installed informational technology template, including the generic
+# tech-detect.yaml and standalone per-product detectors (e.g. Tableau Server).
+# Keep this directory-only scope: do NOT scan generic vulnerability templates.
+TECH_DETECT_DIRECTORY = os.path.expanduser('~/nuclei-templates/http/technologies')
+
 
 # Explicit mappings for detector names that do not match the most useful
 # Nuclei template tag directly.
@@ -1592,77 +1649,58 @@ def normalizeDetectedTarget(finding):
 
 
 def runTechDetect(scope, on_finding=None):
-    """
-    Run tech-detect.yaml once against a complete target scope.
+    """Run all informational HTTP technology templates over the current scope.
 
-    JSONL findings are processed as they are emitted so detections can be
-    displayed immediately instead of waiting for the whole Nuclei process
-    to finish.
+    The entire technologies directory is selected, not only `tech-detect.yaml`
+    or templates carrying a particular tag. Restrict to severity info so this
+    fingerprint phase does not run vulnerability-checking severity templates.
+    Findings are streamed as JSONL for incremental database storage.
     """
-    if not os.path.isfile(TECH_DETECT_TEMPLATE):
-        print(f"Tech detect template not found: {TECH_DETECT_TEMPLATE}", flush=True)
+    if not scope:
+        return []
+    if not os.path.isdir(TECH_DETECT_DIRECTORY):
+        print(f'Technology template directory missing: {TECH_DETECT_DIRECTORY}', flush=True)
         return None
 
     cmd = [
-        "nuclei",
-        "-t", TECH_DETECT_TEMPLATE,
-        "-rl", "10",
-        "-iserver", nuclei_iserver,
-        "-silent",
-        "-jsonl",
-        "-nc"
+        'nuclei', '-t', TECH_DETECT_DIRECTORY,
+        '-severity', 'info',
+        '-rl', '10', '-iserver', nuclei_iserver,
+        '-silent', '-jsonl', '-nc', '-dr'
     ]
-
+    print(f'[tech-detect] Running ALL informational templates from '
+          f'{TECH_DETECT_DIRECTORY} on {len(scope)} asset(s)', flush=True)
     findings = []
-
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1
-        )
-
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
         if proc.stdin:
-            proc.stdin.write("\n".join(scope) + "\n")
+            proc.stdin.write('\n'.join(scope) + '\n')
             proc.stdin.close()
-
         if proc.stdout:
             for line in proc.stdout:
-                line = line.strip()
-
-                if not line:
-                    continue
-
                 try:
                     finding = json.loads(line)
-                except json.JSONDecodeError:
+                except (ValueError, TypeError):
                     continue
-
+                if not isinstance(finding, dict):
+                    continue
                 findings.append(finding)
-
                 if on_finding:
                     on_finding(finding)
-
-        returncode = proc.wait()
-
-        if returncode != 0:
-            print(
-                f"Tech detection Nuclei exited with status {returncode}",
-                flush=True
-            )
+        stderr = proc.stderr.read().strip() if proc.stderr else ''
+        code = proc.wait()
+        if code != 0:
+            print(f'[tech-detect] Nuclei exited with status {code}: '
+                  f'{stderr[-800:]}', flush=True)
             return None
-
     except FileNotFoundError:
-        print("nuclei executable not found in PATH.", flush=True)
+        print('[tech-detect] Nuclei executable missing from PATH', flush=True)
         return None
-
-    except Exception as e:
-        print(f"Error running tech detection: {e}", flush=True)
+    except (OSError, ValueError) as exc:
+        print(f'[tech-detect] {type(exc).__name__}: {exc}', flush=True)
         return None
-
     return findings
 
 
@@ -1832,38 +1870,35 @@ def runSmartScan(context, target_filter=None, new_only=False):
         return
 
     matched_target = False
-
-    for target in context['targetlist']:
+    selected = []
+    for target in context.get('targetlist', []):
+        if not isinstance(target, dict):
+            continue
         codename = target.get('codename', '')
-
-        if target_filter:
-            if codename.lower() != target_filter.lower():
-                continue
-            matched_target = True
-
-        try:
-            category_name = target['category']['name'].lower()
-        except (KeyError, TypeError, AttributeError):
+        if target_filter and codename.lower() != target_filter.lower():
             continue
-
-        if category_name not in ("host", "web application"):
+        matched_target = True
+        category_name = ((target.get('category') or {}).get('name') or '').strip().lower()
+        if category_name not in ('host', 'web application'):
             if target_filter:
-                print(
-                    f"[{codename}] Target is category '{category_name}', "
-                    "smartscan only supports Host and Web Application targets.",
-                    flush=True
-                )
+                print(f"[{codename}] Target is category '{category_name}', "
+                      'smartscan only supports Host and Web Application targets.', flush=True)
             continue
-
         if new_only and db.has_completed_smartscan(codename):
             print(f"[{codename}][smartscan] skipping - previously completed", flush=True)
             continue
+        selected.append(target)
+
+    total = len(selected)
+    print(f'[smartscan] Processing {total} target(s)', flush=True)
+    for position, target in enumerate(selected, start=1):
+        codename = target['codename']
 
         if not checkLoginStatus():
             print("Synack authentication is no longer valid.", flush=True)
             return
 
-        print(f"[{codename}] Connecting to Synack target...", flush=True)
+        print(f"[{position}/{total}][{codename}] Connecting to Synack target...", flush=True)
 
         connect_status = connectToTarget(codename)
 
@@ -1911,37 +1946,13 @@ def runSmartScan(context, target_filter=None, new_only=False):
         hosts_by_tag = defaultdict(set)
 
         def handleTechFinding(finding):
-            matcher = (
-                finding.get("matcher-name")
-                or finding.get("matcher_name")
-                or ""
-            )
-
-            scan_target = normalizeDetectedTarget(finding)
-
-            if not matcher or not scan_target:
+            parsed = storeTechDetectionForFingerprint(codename, finding, available_tags)
+            if parsed is None:
                 return
-
-            tags = resolveTechTags(matcher, available_tags)
-
-            # Persist the fingerprint even when there is no useful follow-on
-            # Nuclei tag. Follow-up scan findings remain stdout-only.
-            db.store_technology(
-                codename=codename,
-                asset=scan_target,
-                technology=matcher,
-                source="nuclei-tech-detect",
-                detector=matcher,
-                tags=tags,
-            )
-
+            scan_target, technology, _source, _detector, tags = parsed
             for tag in tags:
                 hosts_by_tag[tag].add(scan_target)
-                print(
-                    f"[{codename}][tech] "
-                    f"{matcher} -> {tag} @ {scan_target}",
-                    flush=True
-                )
+                print(f'[{codename}][tech] {technology} -> {tag} @ {scan_target}', flush=True)
 
         try:
             tech_results = runTechDetect(scope, on_finding=handleTechFinding)
@@ -2074,7 +2085,13 @@ def registerUnregisteredBotTargets():
             raise RuntimeError("Unexpected unregistered target response")
         if not items:
             break
-        slugs.extend(str(x["slug"]) for x in items if isinstance(x, dict) and x.get("slug"))
+        for item in items:
+            if not isinstance(item, dict) or not item.get('slug'):
+                continue
+            if isExcludedTarget(item.get('codename')):
+                print(f"[bot][register][excluded] Skipping {item.get('codename')}", flush=True)
+                continue
+            slugs.append(str(item['slug']))
         page += 1
         if page > 1000:
             raise RuntimeError("Unregistered target pagination exceeded limit")
@@ -2156,8 +2173,11 @@ def runBot(context, interval=600, once=False):
                     print(f"[bot] {len(newly_discovered)} newly registered targets", flush=True)
                     for target in newly_discovered:
                         botSlack('new', target.get('codename'))
-                    for target in db.bot_pending_targets(targets):
+                    pending_targets = db.bot_pending_targets(targets)
+                    total_pending = len(pending_targets)
+                    for position, target in enumerate(pending_targets, start=1):
                         codename = target["codename"]
+                        print(f'[{position}/{total_pending}][{codename}][bot] Processing target', flush=True)
                         synack_id = str(target["id"])
                         if db.has_completed_smartscan(codename):
                             print(f"[{codename}][bot] Previously scanned; skipping", flush=True)
@@ -2201,13 +2221,15 @@ folder_path = "/home/AMBERJACK/8pm493i9kc/automation/bulkcommand/data"
 codenames = []
 for t in context.get('targetlist', []):
     codenames.append(t['codename'])
+# Excluding a target from scans must never delete its existing on-disk data.
+codenames.extend(excludedTargetCodenames())
 for item in (os.listdir(folder_path) if module != 'bot' and os.path.isdir(folder_path) else []):
     item_path = os.path.join(folder_path, item)
 
     # Check if it's a directory
     if os.path.isdir(item_path):
         # If folder name not in keep_list, remove it
-        if item not in codenames:
+        if item.casefold() not in {name.casefold() for name in codenames}:
             print(f"Removing: {item_path}")
             shutil.rmtree(item_path)
         #else:
@@ -2251,10 +2273,13 @@ elif module == "nuclei":
                         help="Synack target category (default: all)")
     parser.add_argument("--target", "-t", metavar="CODENAME",
                         help="Scan only the specified Synack target codename")
+    parser.add_argument("--skip-discovery", action="store_true",
+                        help="Skip host discovery on existing targets, discover new Host targets once")
     parser.add_argument("--bearer", help="Synack bearer token (existing option)")
     args = parser.parse_args(sys.argv[2:])
     runNucleiTemplate(context, args.template_path, category_filter=args.category,
-                      nuclei_kind=args.nuclei_kind, target_filter=args.target)
+                      nuclei_kind=args.nuclei_kind, target_filter=args.target,
+                      skip_existing_discovery=args.skip_discovery)
 
 elif module == "smartscan":
     target_filter = None
