@@ -1,0 +1,27 @@
+
+id: tableau-eps-ssrf-workflow
+
+info:
+  name: Tableau Security Workflow
+  author: jtc-security
+  severity: critical
+  description: |
+    Tableau version fingerprint followed by GraphQL exposure,
+    VizPortal XXE, Fluent Bit configuration disclosure, and
+    conditional EPS SSRF checks.
+  tags: tableau,ssrf,xxe,exposure,workflow
+
+workflows:
+  - template: /home/AMBERJACK/8pm493i9kc/nuclei-custom/tableau/tableau-version-detect.yaml
+    subtemplates:
+      - template: /home/AMBERJACK/8pm493i9kc/nuclei-custom/tableau/tableau-version-detect.yaml
+
+      - template: /home/AMBERJACK/8pm493i9kc/nuclei-custom/tableau/tableau-graphql-exposed.yaml
+
+      - template: /home/AMBERJACK/8pm493i9kc/nuclei-custom/tableau/tableau-vizportal-xxe.yaml
+
+      - template: /home/AMBERJACK/8pm493i9kc/nuclei-custom/tableau/tableau-fluent-bit-config-disclosure.yaml
+
+      - template: /home/AMBERJACK/8pm493i9kc/nuclei-custom/tableau/tableau-session-fuzz.yaml
+        subtemplates:
+          - template: /home/AMBERJACK/8pm493i9kc/nuclei-custom/tableau/tableau-eps-ssrf.yaml

@@ -1,0 +1,28 @@
+id: tableau-graphql-exposed
+
+info:
+  name: Tableau Relationship WAR GraphQL Exposed
+  author: jtc-security
+  severity: high
+  description: Tableau metadata relationship-service-war GraphQL endpoint is accessible without authentication.
+  tags: tableau,graphql,exposure
+
+http:
+  - method: POST
+    path:
+      - "{{BaseURL}}/api/metadata/relationship-service-war/graphql"
+    headers:
+      Content-Type: application/json
+      Accept: application/json
+    body: '{"query":"{ __typename }"}'
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: body
+        words:
+          - "__typename"
+
+      - type: status
+        status:
+          - 200

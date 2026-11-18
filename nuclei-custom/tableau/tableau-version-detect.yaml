@@ -1,0 +1,42 @@
+id: tableau-version-detect
+
+info:
+  name: Tableau Server Version Detection
+  author: jtc-security
+  severity: info
+  description: Detects Tableau Server via /api/3.0/serverinfo and extracts productVersion.
+  tags: tableau,version,detect
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/3.0/serverinfo"
+    headers:
+      Accept: application/xml
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        words:
+          - "tableau.com"
+          - "productVersion"
+        condition: and
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: regex
+        name: product_version
+        group: 1
+        regex:
+          - '<productVersion[^>]*>([0-9]+\.[0-9]+\.[0-9]+[^<]*)</productVersion>'
+        internal: true
+
+      - type: regex
+        group: 1
+        regex:
+          - '<productVersion[^>]*>([0-9]+\.[0-9]+\.[0-9]+[^<]*)</productVersion>'
+
+

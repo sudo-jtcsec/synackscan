@@ -1,0 +1,30 @@
+
+id: tableau-fluent-bit-config-disclosure
+
+info:
+  name: Tableau Server Fluent Bit Configuration Disclosure
+  author: JTC-Security
+  severity: medium
+  description: |
+    Detects publicly accessible Fluent Bit configuration files
+    through Tableau Server's /errors/ directory.
+  tags: tableau,exposure,config,fluent-bit,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/errors/fluent-bit.conf"
+      - "{{BaseURL}}/errors/fluent-bit-win.conf"
+
+    stop-at-first-match: false
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: body
+        words:
+          - "[SERVICE]"
