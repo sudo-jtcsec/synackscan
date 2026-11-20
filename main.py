@@ -1299,11 +1299,11 @@ def _streamNucleiFindings(cmd, scope, codename, vhost=None):
 
 
 def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind="auto", target_filter=None, skip_existing_discovery=False):
-    """Scan scoped assets; optionally skip discovery on previously seen Host targets.
+    """Scan current scope and, for Host targets, eligible IP-pinned vhosts.
 
-    Skipping discovery still fetches current scope, but avoids PTR, TLS/HTTPS,
-    Chaos, and vhost probes. Previously observed vhosts are not reused without
-    fresh eligibility checks; original scoped assets still run Nuclei.
+    --skip-discovery suppresses PTR/TLS/Chaos and candidate probing, instead
+    loading previously qualified IP/hostname pairs from the fingerprint DB.
+    Every pair must still belong to an IP in the current Synack scope.
     """
     template_path = os.path.expanduser(template_path)
     if nuclei_kind not in {"auto", "template", "workflow"}:
@@ -1365,11 +1365,10 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
                 continue
             print(f"[{codename}] Connected. Verified launchpoint: {cslug}", flush=True)
             category = ((target.get('category') or {}).get('name') or '').strip().lower()
-            skip_discovery = (skip_existing_discovery and category == 'host'
-                              and db.has_completed_host_discovery(codename))
+            skip_discovery = skip_existing_discovery and category == 'host'
             if skip_discovery:
-                print(f"[{codename}][vhost] Skipping previously completed host discovery; "
-                      "scanning original scope only.", flush=True)
+                print(f"[{codename}][vhost] Discovery disabled; using saved SQLite vhosts "
+                      "with current Synack IP scope.", flush=True)
             try:
                 scope = getScope(context, codename, discover_hosts=not skip_discovery)
             except requests.RequestException as exc:
@@ -1383,7 +1382,7 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
                 db.mark_host_discovery_completed(codename)
             print(f"[{codename}] Scope loaded: {len(scope)} assets. Starting Nuclei.", flush=True)
             stats = VHOST_DISCOVERY_STATS.get(codename)
-            if stats is not None and ((target.get('category') or {}).get('name') or '').strip().lower() == 'host':
+            if not skip_discovery and stats is not None and category == 'host':
                 print(f"[{codename}][vhost] Discovery complete: candidates_tested={stats['tested']} "
                       f"baseline_matches={stats['baseline_matches']} different_status={stats['different_status']} "
                       f"connection_errors={stats['connection_errors']} "
@@ -1391,7 +1390,7 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
                       f"capped={stats['capped']}", flush=True)
             _streamNucleiFindings(base_cmd, scope, codename)
             category = ((target.get('category') or {}).get('name') or '').strip().lower()
-            if category != 'host' or skip_discovery:
+            if category != 'host':
                 continue
             authorized_ips = set()
             for asset in scope:
@@ -1399,8 +1398,9 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
                     authorized_ips.add(str(ipaddress.ip_address(asset)))
                 except ValueError:
                     continue
-            # Never substitute discovered hostnames as standalone targets.
-            # Only scan successful pinned-IP HTTPS vhosts discovered under this target.
+            # Keep all connections pinned to IPs in the CURRENT Synack scope.
+            # With --skip-discovery, reuse qualified vhost observations from
+            # fingerprint; never run Chaos, PTR, certificate or baseline probes.
             rows = db.get_vhosts_for_nuclei(codename)
             seen = set()
             approved = VHOST_CURRENT_ELIGIBLE.get(codename, set())
@@ -1408,18 +1408,24 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
             for row in rows:
                 ip = row['ip']
                 hostname = row['hostname']
-                # Never Nuclei-scan stale database entries from IPs whose current
-                # HTTPS precheck failed (even when an old row is marked distinct).
-                if (ip not in authorized_ips or
+                if ip not in authorized_ips or (ip, hostname) in seen:
+                    continue
+                # Normal mode only uses pairs validated THIS run. Cached mode
+                # intentionally reuses previously qualified DB pairs.
+                if not skip_discovery and (
                         ip not in VHOST_LIVE_HTTPS_IPS.get(codename, set()) or
-                        (ip, hostname) not in approved or
-                        (ip, hostname) in seen):
+                        (ip, hostname) not in approved):
                     continue
                 if not validDnsName(hostname) or hostname.startswith('*.'):
                     continue
                 seen.add((ip, hostname))
                 accepted_pairs.append((ip, hostname))
-            print(f"[{codename}][nuclei][vhost] Accepted pairs for this run: {len(accepted_pairs)}", flush=True)
+            source = 'saved SQLite observations' if skip_discovery else 'current discovery'
+            print(f"[{codename}][nuclei][vhost] Accepted pairs from {source}: "
+                  f"{len(accepted_pairs)}", flush=True)
+            if skip_discovery and not accepted_pairs:
+                print(f"[{codename}][nuclei][vhost] No qualifying saved vhosts for "
+                      "current scoped IPs. Original scoped assets were scanned.", flush=True)
             for ip, hostname in sorted(accepted_pairs):
                 print(f"[{codename}][nuclei][vhost][accepted] {ip}:443 SNI/Host={hostname}", flush=True)
             for ip, hostname in sorted(accepted_pairs):
@@ -2414,7 +2420,7 @@ elif module == "nuclei":
     parser.add_argument("--target", "-t", metavar="CODENAME",
                         help="Scan only the specified Synack target codename")
     parser.add_argument("--skip-discovery", action="store_true",
-                        help="Skip host discovery on existing targets, discover new Host targets once")
+                        help="Skip PTR/TLS/Chaos discovery and scan saved DB vhosts on current scoped IPs")
     parser.add_argument("--bearer", help="Synack bearer token (existing option)")
     args = parser.parse_args(sys.argv[2:])
     runNucleiTemplate(context, args.template_path, category_filter=args.category,
