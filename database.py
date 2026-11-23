@@ -208,6 +208,68 @@ class ReconDB:
                 ON http_observations(ip);
             """
         )
+        # Upgrade legacy databases in place. NULL means no recorded baseline
+        # comparison, never "validated". Existing observations remain intact.
+        columns = {row[1] for row in self.conn.execute(
+            "PRAGMA table_info(vhost_observations)")}
+        for name, ddl in (
+            ("baseline_status_code", "INTEGER"),
+            ("is_distinct", "INTEGER CHECK(is_distinct IN (0, 1))"),
+            ("validated_at", "TEXT"),
+        ):
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE vhost_observations ADD COLUMN {name} {ddl}")
+        self.conn.commit()
+
+        # Earlier versions accidentally created is_distinct as NOT NULL.
+        # An untested wildcard or legacy candidate must remain NULL (unknown),
+        # not 0 (tested and baseline-matching). Rebuild just this table once,
+        # preserving every recorded observation and primary key.
+        metadata = {row[1]: row for row in self.conn.execute(
+            "PRAGMA table_info(vhost_observations)")}
+        if metadata['is_distinct'][3]:
+            print('[db] Migrating vhost_observations.is_distinct to nullable (preserving rows)', flush=True)
+            with self.conn:
+                self.conn.execute("""
+                    CREATE TABLE vhost_observations_migrated (
+                        id INTEGER PRIMARY KEY,
+                        target_id INTEGER NOT NULL,
+                        ip TEXT NOT NULL,
+                        hostname TEXT NOT NULL,
+                        discovery_source TEXT NOT NULL,
+                        status_code INTEGER,
+                        redirect_location TEXT,
+                        webserver TEXT,
+                        error TEXT,
+                        first_seen TEXT NOT NULL,
+                        last_seen TEXT NOT NULL,
+                        baseline_status_code INTEGER,
+                        is_distinct INTEGER CHECK(is_distinct IN (0, 1)),
+                        validated_at TEXT,
+                        FOREIGN KEY(target_id) REFERENCES targets(id) ON DELETE CASCADE,
+                        UNIQUE(target_id, ip, hostname, discovery_source)
+                    )
+                """)
+                self.conn.execute("""
+                    INSERT INTO vhost_observations_migrated
+                        (id, target_id, ip, hostname, discovery_source,
+                         status_code, redirect_location, webserver, error,
+                         first_seen, last_seen, baseline_status_code,
+                         is_distinct, validated_at)
+                    SELECT id, target_id, ip, hostname, discovery_source,
+                           status_code, redirect_location, webserver, error,
+                           first_seen, last_seen, baseline_status_code,
+                           CASE WHEN validated_at IS NULL THEN NULL ELSE is_distinct END,
+                           validated_at
+                    FROM vhost_observations
+                """)
+                self.conn.execute('DROP TABLE vhost_observations')
+                self.conn.execute('ALTER TABLE vhost_observations_migrated RENAME TO vhost_observations')
+                self.conn.execute('CREATE INDEX idx_vhost_observations_ip ON vhost_observations(ip)')
+                self.conn.execute('CREATE INDEX idx_vhost_observations_hostname ON vhost_observations(hostname)')
+            print('[db] Vhost validation schema migrated successfully', flush=True)
+
         # Legacy databases may already have discovered host assets or vhosts.
         # Backfill once, before new targets are synced into this database.
         self.conn.execute("""
@@ -444,36 +506,87 @@ class ReconDB:
         return row["id"] if row else None
 
     def store_vhost_observation(self, codename, ip, hostname, source, observation):
-        """Store pinned-IP HTTPS probe or wildcard-certificate observation."""
+        """Persist HTTPS observations AND the baseline comparison when available."""
         target_id = self.ensure_target(codename)
         now = utcnow()
         observation = observation or {}
+        distinct = observation.get('is_distinct')
+        distinct = None if distinct is None else int(bool(distinct))
         with self.conn:
             self.conn.execute("""
                 INSERT INTO vhost_observations
                     (target_id, ip, hostname, discovery_source, status_code,
-                     redirect_location, webserver, error, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     redirect_location, webserver, error, first_seen, last_seen,
+                     baseline_status_code, is_distinct, validated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(target_id, ip, hostname, discovery_source) DO UPDATE SET
                     status_code=excluded.status_code,
                     redirect_location=excluded.redirect_location,
                     webserver=excluded.webserver,
                     error=excluded.error,
-                    last_seen=excluded.last_seen
+                    last_seen=excluded.last_seen,
+                    baseline_status_code=excluded.baseline_status_code,
+                    is_distinct=excluded.is_distinct,
+                    validated_at=excluded.validated_at
             """, (
                 target_id, str(ip), str(hostname), str(source),
                 observation.get('status_code'), observation.get('location'),
-                observation.get('server'), observation.get('error'), now, now
+                observation.get('server'), observation.get('error'), now, now,
+                observation.get('baseline_status_code'), distinct,
+                now if distinct is not None else None
             ))
 
+    def get_unvalidated_vhosts(self, codename, scoped_ips):
+        """Legacy certificate/Chaos pairs needing verification; NO discovery."""
+        scoped_ips = sorted(set(scoped_ips))
+        if not scoped_ips:
+            return []
+        placeholders = ','.join('?' for _ in scoped_ips)
+        return self.conn.execute(f"""
+            SELECT DISTINCT v.ip, v.hostname
+            FROM vhost_observations v
+            JOIN targets t ON t.id=v.target_id
+            WHERE lower(t.codename)=lower(?)
+              AND v.ip IN ({placeholders})
+              AND v.is_distinct IS NULL
+              AND v.hostname NOT LIKE '*.%'
+              AND v.discovery_source IN ('certificate','chaos-wildcard')
+            ORDER BY v.ip, v.hostname
+        """, (codename, *scoped_ips)).fetchall()
+
+    def save_vhost_validation(self, codename, ip, hostname, baseline_status, observation):
+        """Store a successfully compared pair across all its discovery sources.
+
+        Missing baseline or candidate HTTP response never counts as validation.
+        Those rows stay NULL and are retried on a future --skip-discovery run.
+        """
+        status = observation.get('status_code')
+        if baseline_status is None or status is None:
+            return False
+        distinct = int(status != baseline_status)
+        with self.conn:
+            self.conn.execute("""
+                UPDATE vhost_observations
+                   SET baseline_status_code=?, is_distinct=?, validated_at=?,
+                       status_code=?, redirect_location=?, webserver=?, error=?,
+                       last_seen=?
+                 WHERE target_id=(SELECT id FROM targets WHERE lower(codename)=lower(?))
+                   AND ip=? AND hostname=?
+                   AND discovery_source IN ('certificate','chaos-wildcard')
+            """, (baseline_status, distinct, utcnow(), status,
+                  observation.get('location'), observation.get('server'),
+                  observation.get('error'), utcnow(), codename, ip, hostname))
+        return bool(distinct)
+
     def get_vhosts_for_nuclei(self, codename):
-        """Only successful, concrete certificate/Chaos hostnames on scoped IPs."""
+        """Only baseline-validated distinct certificate/Chaos hostnames."""
         return self.conn.execute("""
             SELECT DISTINCT v.ip, v.hostname
             FROM vhost_observations v
             JOIN targets t ON t.id=v.target_id
             WHERE lower(t.codename)=lower(?)
-              AND v.status_code BETWEEN 200 AND 599
+              AND v.is_distinct=1
+              AND v.status_code BETWEEN 100 AND 599
               AND v.hostname NOT LIKE '*.%'
               AND v.discovery_source IN ('certificate','chaos-wildcard')
             ORDER BY v.ip, v.hostname

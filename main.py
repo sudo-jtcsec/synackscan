@@ -1271,17 +1271,15 @@ def _streamNucleiFindings(cmd, scope, codename, vhost=None):
                 continue
             if vhost is None:
                 new = db.store_bot_finding(codename, finding)
-                if new:
-                    print(f"[{codename}][nuclei] "
-                          f"{finding.get('template-id', '-')}: "
-                          f"{finding.get('matched-at', finding.get('host', '-'))}", flush=True)
+                print(f"[{codename}][nuclei][{'NEW' if new else 'EXISTING'}] "
+                      f"{finding.get('template-id', '-')}: "
+                      f"{finding.get('matched-at', finding.get('host', '-'))}", flush=True)
             else:
                 ip, hostname = vhost
                 new = db.store_vhost_nuclei_finding(codename, ip, hostname, finding)
-                if new:
-                    print(f"[{codename}][nuclei][vhost] {hostname} @ {ip}:443 "
-                          f"{finding.get('template-id', '-')}: "
-                          f"{finding.get('matched-at', finding.get('host', '-'))}", flush=True)
+                print(f"[{codename}][nuclei][vhost][{'NEW' if new else 'EXISTING'}] {hostname} @ {ip}:443 "
+                      f"{finding.get('template-id', '-')}: "
+                      f"{finding.get('matched-at', finding.get('host', '-'))}", flush=True)
         stderr = proc.stderr.read().strip() if proc.stderr else ''
         code = proc.wait()
         if code != 0:
@@ -1296,6 +1294,57 @@ def _streamNucleiFindings(cmd, scope, codename, vhost=None):
     except (OSError, ValueError) as exc:
         print(f"[{codename}][nuclei] {type(exc).__name__}: {exc}", flush=True)
         return False
+
+
+def validateSavedVhosts(codename, scoped_ips):
+    """Recover missing baseline decisions from existing SQLite candidates only.
+
+    Does NOT enumerate hostnames, query Chaos, perform DNS lookups, or inspect
+    TLS certificates. Uses the same pinned-IP HTTPS SNI/Host probe as fingerprint.
+    Existing is_distinct=0/1 rows are trusted and not re-probed.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    saved = db.get_unvalidated_vhosts(codename, scoped_ips)
+    saved = [(str(row['ip']), str(row['hostname'])) for row in saved
+             if validDnsName(row['hostname'])]
+    if not saved:
+        print(f"[{codename}][vhost][recovery] No legacy pairs need validation", flush=True)
+        return
+
+    grouped = defaultdict(list)
+    for ip, hostname in saved:
+        grouped[ip].append(hostname)
+    print(f"[{codename}][vhost][recovery] Validating {len(saved)} saved pairs "
+          f"on {len(grouped)} currently scoped IP(s); no enumeration", flush=True)
+
+    # Exactly one nonexistent-host baseline per scoped IP, not one per candidate.
+    baseline_by_ip = {}
+    def get_baseline(ip):
+        return ip, probeHostOnScopedIP(ip, 'doesnotexist.target.tld').get('status_code')
+    with ThreadPoolExecutor(max_workers=min(12, len(grouped))) as pool:
+        for ip, status in pool.map(get_baseline, grouped):
+            baseline_by_ip[ip] = status
+            print(f"[{codename}][vhost][recovery] {ip}:443 baseline={status}", flush=True)
+
+    to_probe = [(ip, hostname) for ip, hostname in saved if baseline_by_ip[ip] is not None]
+    stats = {'validated': 0, 'rejected': 0, 'retry_later': len(saved) - len(to_probe)}
+    def probe_pair(pair):
+        ip, hostname = pair
+        return pair, probeHostOnScopedIP(ip, hostname)
+    if to_probe:
+        with ThreadPoolExecutor(max_workers=min(12, len(to_probe))) as pool:
+            for (ip, hostname), observation in pool.map(probe_pair, to_probe):
+                if observation.get('status_code') is None:
+                    stats['retry_later'] += 1
+                    continue
+                distinct = db.save_vhost_validation(
+                    codename, ip, hostname, baseline_by_ip[ip], observation)
+                stats['validated' if distinct else 'rejected'] += 1
+    print(f"[{codename}][vhost][recovery][summary] "
+          f"validated_distinct={stats['validated']} "
+          f"baseline_matches={stats['rejected']} "
+          f"unverified_retry_later={stats['retry_later']}", flush=True)
 
 
 def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind="auto", target_filter=None, skip_existing_discovery=False):
@@ -1368,7 +1417,7 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
             skip_discovery = skip_existing_discovery and category == 'host'
             if skip_discovery:
                 print(f"[{codename}][vhost] Discovery disabled; using saved SQLite vhosts "
-                      "with current Synack IP scope.", flush=True)
+                      "and recovering missing baseline checks on scoped IPs.", flush=True)
             try:
                 scope = getScope(context, codename, discover_hosts=not skip_discovery)
             except requests.RequestException as exc:
@@ -1398,9 +1447,11 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
                     authorized_ips.add(str(ipaddress.ip_address(asset)))
                 except ValueError:
                     continue
-            # Keep all connections pinned to IPs in the CURRENT Synack scope.
-            # With --skip-discovery, reuse qualified vhost observations from
-            # fingerprint; never run Chaos, PTR, certificate or baseline probes.
+            # Only recover saved candidates tied to currently authorized IPs.
+            # This does NOT discover any new hostnames.
+            if skip_discovery:
+                validateSavedVhosts(codename, authorized_ips)
+            # The DB query now requires a saved distinct-baseline validation.
             rows = db.get_vhosts_for_nuclei(codename)
             seen = set()
             approved = VHOST_CURRENT_ELIGIBLE.get(codename, set())
@@ -1410,8 +1461,8 @@ def runNucleiTemplate(context, template_path, category_filter="all", nuclei_kind
                 hostname = row['hostname']
                 if ip not in authorized_ips or (ip, hostname) in seen:
                     continue
-                # Normal mode only uses pairs validated THIS run. Cached mode
-                # intentionally reuses previously qualified DB pairs.
+                # Normal mode additionally requires validation in this run.
+                # Skip mode trusts saved validated results, not raw candidates.
                 if not skip_discovery and (
                         ip not in VHOST_LIVE_HTTPS_IPS.get(codename, set()) or
                         (ip, hostname) not in approved):
@@ -2143,7 +2194,9 @@ def runBotNuclei(codename, scope):
             inserted = db.store_bot_finding(codename, finding)
             if inserted:
                 botSlack('match', codename, severity)
-                print(f'[{codename}][nuclei] {severity} match stored in SQLite', flush=True)
+            print(f'[{codename}][nuclei][{"NEW" if inserted else "EXISTING"}] '
+                  f'{severity} {finding.get("template-id", "-")} @ '
+                  f'{finding.get("matched-at", finding.get("host", "-"))}', flush=True)
         errors = proc.stderr.read() if proc.stderr else ''
         code = proc.wait()
         if code != 0:
